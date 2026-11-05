@@ -116,7 +116,7 @@ class SettingsDialog(QDialog):
         self.apply_button.setProperty('role','primary');self.apply_button.setAutoDefault(True);self.apply_button.setDefault(True)
         self.save_shortcut=QShortcut(QKeySequence('Ctrl+S'),self);self.save_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut);self.save_shortcut.activated.connect(self.apply)
         self.tabs.tabBar().setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        outer.addWidget(footer);self.tabs.currentChanged.connect(self.activate_page);self.activate_page(0);self.reload()
+        outer.addWidget(footer);self.tabs.currentChanged.connect(self.activate_page);self.activate_page(0);self.reload(read_startup=not lazy)
         if hasattr(pet,'materials'):pet.materials.changed.connect(self.refresh_character_material_hint)
         if hasattr(pet,'settingsChanged'):pet.settingsChanged.connect(self.sync_from_pet)
         pet.bubble.dataBusyChanged.connect(self.update_refresh_state)
@@ -134,6 +134,7 @@ class SettingsDialog(QDialog):
         if frame is None and motion and previous!=index and self.isVisible():frame=motion.snapshot(self.tabs.widget(previous))
         if motion:motion.clear()
         self.build_page(index)
+        if index==2:self.sync_from_pet(read_startup=True)
         for i,button in enumerate(self.category_buttons):button.setChecked(i==index)
         self.category_title.setText(self.page_titles[index]);self.tabs.widget(index).verticalScrollBar().setValue(0);self.update_draft_state()
         self._category_index=index
@@ -244,6 +245,7 @@ class SettingsDialog(QDialog):
     def build_page_2(self):
         pet=self.pet
         connection=self.tab('Codex 联动')
+        pricing=QPushButton('计价设置');pricing.clicked.connect(self.open_pricing);connection.addRow(pricing)
         self.section(connection,'运行联动',None)
         self.codex_startup=SettingsSwitchRow('随 Codex 桌面端启动');connection.addRow(self.codex_startup)
         self.field_tabs['codex_startup']=self._building_index;self.field_titles['codex_startup']='随 Codex 启动'
@@ -303,6 +305,12 @@ class SettingsDialog(QDialog):
         self.paths_card=AnimatedDisclosure(path_body);connection.addRow(self.paths_card);self.path_toggle.toggled.connect(self.paths_card.set_expanded)
         self.path_source.currentIndexChanged.connect(self.path_source_changed);self.path_source_changed()
 
+    def open_pricing(self):
+        from pricing_ui import open_editor
+        data=getattr(self.pet.bubble,'token_snapshot',{}).get('projects',{})
+        models={m['model'] for p in data.get('ranges',{}).get('all',[]) for m in p['model_usage']}
+        open_editor(self.tabs,models,self.pet.refresh_tokens)
+
     def build_page_3(self):
         pet=self.pet
         library=self.tab('角色与素材')
@@ -341,19 +349,24 @@ class SettingsDialog(QDialog):
         self.field_tabs['talk_lines']=self._building_index;self.field_titles['talk_lines']='自定义台词';self.lines.textChanged.connect(lambda:self.edited('talk_lines'))
 
     def build_page_5(self):
+        """维护页保留当前平台可执行的更新、安装和数据入口"""
+        from app_updates import program_updates_supported
         pet=self.pet
+        program_supported=program_updates_supported()
         maintenance=self.tab('更新与维护')
-        self.section(maintenance,'软件更新','检查 GitHub 公开稳定版；下载和安装由你主动发起。')
-        self.check(maintenance,'update_checks','自动检查更新（不自动下载）')
+        self.section(maintenance,'软件更新' if program_supported else '动画更新','检查 GitHub 公开稳定版；下载和安装由你主动发起。' if program_supported else '只检查兼容的动画补丁；程序需手动更新。')
+        if program_supported:self.check(maintenance,'update_checks','自动检查更新（不自动下载）')
         if hasattr(pet,'updates'):
             from update_widgets import UpdatePanel
             self.update_panel=UpdatePanel(pet.updates);maintenance.addRow(self.update_panel)
         self.section(maintenance,'诊断与数据','维护操作立即执行；不属于设置草稿。')
         button=QPushButton('导出诊断');button.setToolTip('导出诊断报告，不含对话和密钥');button.clicked.connect(pet.export_diagnostics);maintenance.addRow(button)
-        if hasattr(pet,'open_install_manager'):
+        if program_supported and hasattr(pet,'open_install_manager'):
             button=QPushButton('程序位置与安装管理');button.clicked.connect(pet.open_install_manager);maintenance.addRow(button)
         data=self.disclosure_form(maintenance,'数据与恢复')
-        for title,hint,slot in [('打开数据目录','打开配置与聊天记录目录',pet.open_data),('备份设置','不含密钥与对话',pet.backup_settings),('恢复设置','恢复设置备份',pet.restore_settings),('查看可清理内容','清理历史版本与备份，先预览',pet.cleanup_installations)]:
+        actions=[('打开数据目录','打开配置与聊天记录目录',pet.open_data),('备份设置','不含密钥与对话',pet.backup_settings),('恢复设置','恢复设置备份',pet.restore_settings)]
+        if program_supported:actions.append(('查看可清理内容','清理历史版本与备份，先预览',pet.cleanup_installations))
+        for title,hint,slot in actions:
             button=QPushButton(title);button.setToolTip(hint);button.clicked.connect(slot);data.addRow(button)
         maintenance.addRow(QLabel('当前版本 '+VERSION))
 
@@ -482,13 +495,20 @@ class SettingsDialog(QDialog):
             try:values['startup']=autostart_enabled();values['codex_startup']=enabled()
             except OSError:self.status.setText('开机启动状态读取失败；其他设置仍可修改。')
         return values
-    def reload(self):
+    def reload(self,*,read_startup=True):
         if hasattr(self.pet,'preview_theme'):self.pet.preview_theme(None)
-        self.status.clear();values=self.values_from_pet(read_startup=True);values.setdefault('startup',False)
+        self.status.clear();values=self.values_from_pet(read_startup)
+        for key in ('startup','codex_startup'):
+            values.setdefault(key,self.draft.baseline.get(key,False) if self.draft else False)
         self.draft=SettingsDraft(values);self.fill(self.draft.values);self.refresh_library();self.update_draft_state()
     def sync_from_pet(self,changes=None,read_startup=False):
         if self.draft is None:return
-        self.draft.rebase(self.values_from_pet(read_startup));self.fill(self.draft.values);self.update_draft_state()
+        previous=self.draft.values.copy()
+        status=(self.draft.dirty,self.draft.conflicts.copy())
+        self.draft.rebase(self.values_from_pet(read_startup))
+        changed=self.draft.values!=previous
+        if changed:self.fill(self.draft.values)
+        if changed or status!=(self.draft.dirty,self.draft.conflicts):self.update_draft_state()
         if self.pet.bubble.panel_page=='settings' and not self._saving:self.preview_theme_draft()
 
     def preview_theme_draft(self):
