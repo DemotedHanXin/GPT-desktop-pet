@@ -99,7 +99,7 @@ class DesktopPet(EnhancedPet):
         self.bubble.conversationRequested.connect(self.open_conversation)
         self.bubble.optionRequested.connect(self.set_option)
         self.bubble.modeChanged.connect(self.save_bubble_mode)
-        if self.settings.get('schema')!=2 and CONFIG.exists():
+        if not self.settings_read_failed and self.settings.get('schema')!=2 and CONFIG.exists():
             shutil.copy2(CONFIG,STATE_DIR/'settings-before-0.5.0.json')
         self.settings=normalized(self.settings)
         from settings_controls import set_motion_mode,settle_motion
@@ -128,6 +128,11 @@ class DesktopPet(EnhancedPet):
         self.codexPresence.connect(self.observe_codex_presence)
         self.codex_timer=QTimer(self);self.codex_timer.setInterval(2000);self.codex_timer.timeout.connect(self.poll_codex_presence)
         if monitor:self.codex_timer.start()
+        if monitor:
+            from official_credit_rates import shared as official_rates
+            self.official_rates=official_rates();self.official_rates.start()
+            from official_api_prices import shared as api_prices
+            self.api_prices=api_prices();self.api_prices.updated.connect(self.refresh_tokens);self.api_prices.start()
         self._tray_update_hint=''
         self._refresh_tray_icon()
         self.tray.activated.disconnect()
@@ -328,13 +333,17 @@ class DesktopPet(EnhancedPet):
         if not self.isVisible() or self.dragging or self.throwing or self.walking or (getattr(self,'edge_dock',None) and self.edge_dock.active):return False
         if now<max(self.next_chain,self.buffer_until,self.status_hold):return False
         if self.settings.get('status_actions',True) and (self.reactions.busy(now) or self.bubble.status_indicator.is_busy()):return False
-        if self.roaming.pending_start or self.roaming.paused_until is not None:
-            self.start_walk();return self.walking
-        if self.roaming.queue:self.start_walk();return self.walking
+        route_pending=self.roaming.pending_start or self.roaming.paused_until is not None or bool(self.roaming.queue)
+        if route_pending:
+            self.start_walk()
+            if self.walking:return True
+            if self.roaming.pending_start:
+                transition=self.bubble.size_transition
+                if transition.running or transition.preparing:return False
         self.next_chain=now+self.settings['random_interval']+self.settings['action_gap']
         choices=['idle'];weights=[30]
         if self.random_actions:choices+=['turn','variant'];weights+=[10,40]
-        if self.wandering and not self.settings['no_move']:choices+=['walk'];weights+=[20]
+        if self.wandering and not route_pending and not self.settings['no_move']:choices+=['walk'];weights+=[20]
         selected=random.choices(choices,weights)[0]
         if selected=='walk':self.start_walk();return self.walking
         if selected=='turn':
@@ -642,6 +651,23 @@ class DesktopPet(EnhancedPet):
 
     @measured('ui_activity')
     def on_activity(self,event):
+        if event.get('kind')=='hidden_sessions':
+            from session_read_state import session_id
+            excluded={session_id(s) for s in event.get('sessions',[])}
+            self._hidden_activity_sessions=excluded
+            roster=self.bubble.roster
+            for sid in excluded:
+                roster.items.pop(sid,None);roster.names.pop(sid,None)
+            for entries in (self.reactions.sessions,self.reactions.leases,self.reactions.openings):
+                for key in list(entries):
+                    if session_id(key[0] if isinstance(key,tuple) else key) in excluded:entries.pop(key,None)
+            roster.pending.difference_update(excluded);roster.pinned=[s for s in roster.pinned if s not in excluded]
+            if self.reactions.completion and session_id(self.reactions.completion.get('session','')) in excluded:self.reactions.completion=None
+            if getattr(self,'pending_completion',None) and session_id(self.pending_completion.get('session','')) in excluded:self.pending_completion=None
+            if self.reactions.latest and session_id(self.reactions.latest.get('session','')) in excluded:self.reactions.latest=None
+            self.bubble.status_indicator.exclude_sessions(excluded);self.bubble.refresh_status();return
+        from session_read_state import session_id
+        if session_id(event.get('session','')) in getattr(self,'_hidden_activity_sessions',set()):return
         if event.get('kind')=='animation_lifecycle':
             self.reactions.confirm(event.get('session',''),event.get('turn',''),event.get('active',False),time.monotonic());return
         if event.get('kind')=='connection_health':
@@ -794,7 +820,8 @@ class DesktopPet(EnhancedPet):
         self.next_chain=time.monotonic()+self.settings['random_interval'];self.next_talk=time.monotonic()+self.settings['talk_min']
         self.schedule_animation()
         if save:
-            try:self.save_settings()
+            try:
+                if self.save_settings() is False:raise OSError('原设置无法读取，本次未写入。恢复文件后请重启桌宠。')
             except (OSError,ValueError):
                 self.settings=previous;self._card_anchor=copy.deepcopy(previous.get('card_anchor'));self.apply_settings({},save=False);raise
         if changing_theme:self._theme_preview=None;self._theme_preview_pending=False
@@ -866,8 +893,9 @@ class DesktopPet(EnhancedPet):
         return result
 
     def save_settings(self):
+        if self.settings_read_failed:return False
         if not self.enhanced_ready:return
-        super().save_settings()
+        self.collect_settings()
         self.settings['facing']=self.walk_direction
         screen=QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen();a=screen.availableGeometry()
         self.settings['screen_position']=relative_position(self.x(),self.y(),self.width(),self.height(),(a.x(),a.y(),a.width(),a.height()),screen.name())
@@ -1348,7 +1376,8 @@ class DesktopPet(EnhancedPet):
     def backup_settings(self):
         try:
             path=STATE_DIR/('settings-backup-'+time.strftime('%Y%m%d-%H%M%S')+'.json')
-            self.save_settings();value=json.loads(CONFIG.read_text(encoding='utf-8'))
+            if self.save_settings() is False:raise OSError('原设置无法读取，无法备份。')
+            value=json.loads(CONFIG.read_text(encoding='utf-8'))
             if not isinstance(value,dict):raise ValueError('设置文件格式无效')
             atomic_json(path,value)
             self.say('设置备份已保存到配置目录。',5000);return path

@@ -87,10 +87,12 @@ class LiveRateHoverTests(unittest.TestCase):
 
     def test_brief_gap_can_reenter_but_real_leave_stops_watch(self):
         card=self.card();self.show_hint(card);self.position=QPoint(700,500)
-        card._watch_hint();QTest.qWait(40)
-        self.position=card.mapToGlobal(card.rect().center());card._watch_hint();QTest.qWait(200)
-        self.assertTrue(card.popup.isVisible())
-        self.position=QPoint(700,500);card._watch_hint();QTest.qWait(250)
+        card._watch_hint();self.assertTrue(card.hint_leave.isActive())
+        self.position=card.mapToGlobal(card.rect().center());card._watch_hint()
+        self.assertFalse(card.hint_leave.isActive());self.assertTrue(card.popup.isVisible())
+        self.position=QPoint(700,500);card._watch_hint()
+        self.assertTrue(card.hint_leave.isActive())
+        card.hint_leave.stop();card.hint_leave.timeout.emit()
         self.assertFalse(card.popup.isVisible());self.assertFalse(card.hint_watch.isActive())
 
     def test_popup_pointer_and_scroll_survive_same_surface_rebuild(self):
@@ -182,6 +184,42 @@ class LiveRateHoverTests(unittest.TestCase):
     def test_service_panel_deactivate_closes_only_service_panel(self):
         card=self.card();QTest.mouseClick(card,Qt.MouseButton.LeftButton);panel=card.service_panel
         APP.sendEvent(panel,QEvent(QEvent.Type.WindowDeactivate));self.assertFalse(panel.isVisible())
+    def test_second_click_stays_closed_when_deactivate_arrives_before_or_after_press(self):
+        from public_status import shared
+        card=self.card()
+        with patch.object(shared(),'request'):
+            for before_press in (True,False):
+                QTest.mouseClick(card,Qt.MouseButton.LeftButton);panel=card.service_panel;self.assertTrue(panel.isVisible())
+                if before_press:APP.sendEvent(panel,QEvent(QEvent.Type.WindowDeactivate))
+                QTest.mousePress(card,Qt.MouseButton.LeftButton)
+                if not before_press:APP.sendEvent(panel,QEvent(QEvent.Type.WindowDeactivate))
+                QTest.mouseRelease(card,Qt.MouseButton.LeftButton);APP.processEvents()
+                self.assertFalse(panel.isVisible());self.assertFalse(card.popup.isVisible());self.assertFalse(card.hint_delay.isActive())
+    def test_outside_deactivate_and_expired_focus_loss_do_not_consume_a_new_open(self):
+        from public_status import shared
+        import time
+        card=self.card()
+        with patch.object(shared(),'request'):
+            QTest.mouseClick(card,Qt.MouseButton.LeftButton);panel=card.service_panel
+            self.position=QPoint(-1000,-1000);APP.sendEvent(panel,QEvent(QEvent.Type.WindowDeactivate))
+            self.assertFalse(panel.isVisible());QTest.mouseClick(card,Qt.MouseButton.LeftButton);self.assertTrue(panel.isVisible())
+            self.position=card.mapToGlobal(card.rect().center());APP.sendEvent(panel,QEvent(QEvent.Type.WindowDeactivate))
+            card._service_deactivated_at=time.monotonic()-2
+            QTest.mouseClick(card,Qt.MouseButton.LeftButton);self.assertTrue(panel.isVisible())
+    def test_service_has_no_close_symbol_or_right_header_close_hit_target(self):
+        from public_status import shared
+        from PySide6.QtGui import QPainter
+        card=self.card()
+        with patch.object(shared(),'request'):
+            QTest.mouseClick(card,Qt.MouseButton.LeftButton);panel=card.service_panel;labels=[]
+            class Recorder(QPainter):
+                def drawText(self,*args):
+                    if args and isinstance(args[-1],str):labels.append(args[-1])
+                    return super().drawText(*args)
+            with patch('service_rate_ui.QPainter',Recorder):panel.grab()
+            self.assertIn('‹ 会话速率',labels);self.assertNotIn('×',labels)
+            QTest.mouseClick(panel,Qt.MouseButton.LeftButton,pos=QPoint(panel.width()-12,16))
+            self.assertTrue(panel.isVisible());self.assertEqual(panel.page,'service')
 
 
 if __name__=='__main__':unittest.main()

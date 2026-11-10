@@ -2,22 +2,21 @@
 
 在桌面查看 Codex 任务状态、完成提醒、账户额度和 Token 用量，也可以让白龙陪你一起工作。支持仅卡片使用，人物动画按需下载。
 
-**[Windows 首次安装](https://github.com/Wunsch2048/codex-bailong-desktop-pet/releases/download/v1.5.0/bailong-desktop-pet-1.5.0-setup.exe)** | **[程序更新](https://github.com/Wunsch2048/codex-bailong-desktop-pet/releases/latest)** | [Linux 预览版](#linux--niri--kde) | [macOS 社区版](#macos)
+**[Windows 首次安装](https://github.com/Wunsch2048/codex-bailong-desktop-pet/releases/download/v1.6.3/bailong-desktop-pet-1.6.3-setup.exe)** | **[程序更新](https://github.com/Wunsch2048/codex-bailong-desktop-pet/releases/latest)** | [Linux 预览版](#linux--niri--kde) | [macOS 社区版](#macos)
 
-Windows 当前公开版 **v1.5.0**。在线安装器直接获取最新累计程序；已有用户可在“设置 → 维护 → 软件更新”升级，无需逐个安装旧补丁。升级保留设置、统计和已下载素材。
+Windows 当前公开版 **v1.6.3**。在线安装器直接获取最新累计程序；已有用户可在“设置 → 维护 → 软件更新”升级，无需逐个安装旧补丁。升级保留设置、统计和已下载素材。
 
 ![白龙桌宠封面](docs/media/cover.png)
 
 ## 最近更新
 
-### v1.5.0
+- **会话与动作**：修复任务结束后仍显示忙碌、旧回合误结束当前任务的问题。历史任务补查时不再重复提醒，暂停走动也不会一直挡住随机动作。
+- **实时统计与成本**：忽略时间异常的用量记录，避免今日 Token 和实时速率停止更新。退出成本明细后，后台仍会读取最新数据。
+- **聊天与设置**：聊天历史、设置和重置公告暂时读不到时，保留原文件。设置只写入一次，避免提示保存失败后重启却读到新值。
+- **托盘与全屏**：托盘宿主断开后会自动尝试恢复。Codex 进程状态不明确时，桌宠不会因此重复启动。全屏检测暂时失败时，桌宠不会立刻弹回前景。
+- **更新与恢复**：取消下载后可以重试。改进动画目录回退、安装记录读取和统计数据库恢复，遇到权限问题时保留可恢复的文件。
 
-- **查成本**可以从项目一路点到某条会话、某轮对话，还能换币种和导出。
-- **看额度和速率**可以悬停看图表数字、对照两轮额度，或点击「实时」查看服务状态。
-- **和桌宠互动**时，走动中展开卡片会先停下，闲下来再继续走。拖动更跟手，工作时也更安静。
-- **打开和维护**更省事，减少日报、设置重开的等待，修复安装管理入口，并补充失败提示。
-
-[查看 v1.5.0 完整更新与下载](https://github.com/Wunsch2048/codex-bailong-desktop-pet/releases/tag/v1.5.0)
+[查看 v1.6.3 完整更新与下载](https://github.com/Wunsch2048/codex-bailong-desktop-pet/releases/tag/v1.6.3)
 
 ## 主要功能
 
@@ -81,7 +80,7 @@ Linux 适配源码已合入主分支，预览包由 [helantianshen](https://gith
 
 ## 文档与反馈
 
-[使用说明](docs/使用说明.md) | [开发与构建](docs/DEVELOPMENT.md) | [维护规范](docs/维护规范验证入口.md) | [迭代历史](docs/迭代历史.txt) | [提交问题](https://github.com/Wunsch2048/codex-bailong-desktop-pet/issues/new/choose)
+[使用说明](docs/使用说明.md) | [开发与构建](docs/DEVELOPMENT.md) | [维护规范](docs/维护规范验证入口.md) | [迭代历史](docs/迭代历史.txt) · [旧版专项记录](docs/archive) | [提交问题](https://github.com/Wunsch2048/codex-bailong-desktop-pet/issues/new/choose)
 
 反馈请附版本、系统缩放和复现步骤，并去掉截图、日志中的私密信息。
 

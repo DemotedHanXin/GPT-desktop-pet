@@ -28,7 +28,11 @@ def rollout_alias(path):
                 if obj.get('type')=='session_meta':
                     owner=session_id(payload.get('id') or payload.get('session_id') or '')
                     if owner==branch or is_subagent_metadata(payload):return path.stem
-                    if owner==parent:inherited_parent=True
+                    if owner==parent:
+                        base=payload.get('history_base')
+                        if isinstance(base,dict) and session_id(base.get('thread_id',''))==parent:
+                            return parent
+                        inherited_parent=True
                 if obj.get('type')=='event_msg' and payload.get('type')=='task_started':
                     attribution=payload.get('turn_attribution') or {}
                     if not isinstance(attribution,dict):return path.stem
@@ -66,6 +70,48 @@ def subagent_sessions(home,ids):
                 found.update(row[0] for row in rows if is_subagent_metadata(dict(zip(fields,row))))
             return found
     except (OSError,sqlite3.Error,ValueError):return set()
+
+
+def attached_conversations(home,ids):
+    """Resolve only explicit desktop attachments, never names or ordinary forks.
+
+    A missing parent, unknown schema or cycle is not evidence to hide a chat.
+    Read bounded metadata batches; do not read conversation messages.
+    """
+    ids={session_id(s) for s in ids if s}
+    if not ids:return {}
+    try:
+        with closing(sqlite3.connect((Path(home)/'state_5.sqlite').as_uri()+'?mode=ro',uri=True,timeout=.1)) as db:
+            columns={r[1] for r in db.execute('PRAGMA table_info(threads)')}
+            if not {'id','attached_thread_parent_id'}<=columns:return {}
+            graph={};wanted=set(ids)
+            for _ in range(16):
+                missing=sorted(wanted-set(graph))
+                if not missing:break
+                previous_size=len(graph)
+                for start in range(0,len(missing),128):
+                    chunk=missing[start:start+128]
+                    rows=db.execute('SELECT id,attached_thread_parent_id FROM threads WHERE id IN ('+','.join('?' for _ in chunk)+')',chunk)
+                    graph.update((session_id(s),session_id(p) if isinstance(p,str) and p.strip() else '') for s,p in rows)
+                if len(graph)==previous_size:break
+                wanted={p for p in graph.values() if p and p not in graph}
+                if not wanted:break
+            result={}
+            for sid in ids:
+                current=sid;seen=set()
+                while current in graph and current not in seen:
+                    seen.add(current);parent=graph[current]
+                    if not parent:
+                        if current!=sid:result[sid]=current
+                        break
+                    current=parent
+            return result
+    except (OSError,sqlite3.Error,ValueError):return {}
+
+
+def non_user_sessions(home,ids):
+    ids=list(ids)
+    return subagent_sessions(home,ids)|set(attached_conversations(home,ids))
 
 
 def conversation_display_name(metadata):
@@ -188,7 +234,7 @@ def active_conversations(home):
             active=db.execute("SELECT thread_id,turn_id FROM thread_turns a WHERE status='inProgress' AND rollout_ordinal=(SELECT MAX(rollout_ordinal) FROM thread_turns b WHERE b.thread_id=a.thread_id)").fetchall()
         with closing(sqlite3.connect((home/'state_5.sqlite').as_uri()+'?mode=ro',uri=True,timeout=.1)) as db:
             eligible={sid:(name or title) for sid,name,title in db.execute("SELECT id,name,title FROM threads WHERE archived=0 AND (agent_path IS NULL OR agent_path='' OR agent_path='/root') AND (COALESCE(name,'')<>'' OR title<>'' OR has_user_event=1)")}
-        excluded=subagent_sessions(home,[sid for sid,turn in active])
+        excluded=non_user_sessions(home,[sid for sid,turn in active])
         eligible={sid:title for sid,title in eligible.items() if sid not in excluded}
         return [dict(kind='status',session=sid,turn=turn,state='working',title=eligible[sid],text='任务正在进行',active=len([x for x,t in active if x in eligible]),historical_snapshot=True) for sid,turn in active if sid in eligible]
     except (OSError,sqlite3.Error,ValueError):return []

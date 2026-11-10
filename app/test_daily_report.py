@@ -259,8 +259,11 @@ class ReportUiTests(unittest.TestCase):
         opacity=r.windowOpacity();observed=[];show=r.show
         def native_show():
             observed.append((r.windowOpacity(),r.fraction,r.surface.isHidden(),r._frame is not None));show()
-        with patch('daily_report.QApplication.platformName',return_value='windows'),patch('panel_transition.present_barrier'),patch.object(r,'show',side_effect=native_show):r.open()
-        self.assertEqual(observed,[(0.,0.,True,True)]);self.assertAlmostEqual(r.windowOpacity(),opacity)
+        with patch('daily_report.QApplication.platformName',return_value='windows'),patch('panel_transition.present_barrier'),patch.object(r,'show',side_effect=native_show):
+            r.open()
+            self.assertEqual(observed,[(0.,0.,True,True)]);self.assertEqual(r.windowOpacity(),0.)
+            with patch.object(r.windowHandle(),'isExposed',return_value=True):r._open_present_ready()
+        self.assertAlmostEqual(r.windowOpacity(),opacity)
     def test_native_reopen_failure_does_not_leave_report_invisible(self):
         from unittest.mock import patch
         r=self.r;r.setWindowOpacity(.7);opacity=r.windowOpacity()
@@ -297,7 +300,13 @@ class ReportUiTests(unittest.TestCase):
         self.assertEqual(self.r.cycle_view.estimate.text(),'600.0K')
         self.assertIn('75%',self.r.cycle_view.detail.text())
         APP.processEvents()
-        self.assertEqual(self.r.scroll.verticalScrollBar().maximum(),0)
+        area=self.r.scroll;plot=self.r.cycle_view.plot
+        self.assertFalse(area.verticalScrollBar().isVisible())
+        self.assertEqual(area.horizontalScrollBar().maximum(),0)
+        self.assertTrue(area.viewport().rect().contains(plot.mapTo(area.viewport(),plot.rect().bottomRight())))
+        area.verticalScrollBar().setValue(area.verticalScrollBar().maximum());APP.processEvents()
+        button=self.r.cycle_view.rules_button
+        self.assertTrue(area.viewport().rect().contains(button.mapTo(area.viewport(),button.rect().center())))
         self.assertTrue(self.r.cycle_view.note.isHidden() or self.r.cycle_view.rules.isHidden())
         self.assertTrue(self.r.cycle_view.rules_button.isVisible())
         data=dict(data,quota_history=dict(cycles=[dict(item,estimated_total=None,complete=False)]))

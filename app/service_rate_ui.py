@@ -1,8 +1,9 @@
 """Compact service row and in-place detail on the existing realtime bubble."""
 from html import escape
 from datetime import datetime
+import time
 from PySide6.QtCore import Qt,QRect,QRectF,QPoint,QPropertyAnimation,QEasingCurve,QEvent
-from PySide6.QtGui import QPainter,QColor,QPen,QTextDocument
+from PySide6.QtGui import QPainter,QColor,QPen,QTextDocument,QCursor,QFontMetricsF
 from compact_bubble import font
 from theme_registry import palette
 from public_status import shared,bubble_position,service_colors
@@ -66,7 +67,7 @@ def service_bubble(Base):
             if previous:text+='<p>上次记录 '+datetime.fromtimestamp(previous['checked']).strftime('%m/%d %H:%M')+' '+escape(previous['title'])+'</p>'
             incidents=value.get('incidents',[])
             for row in incidents:text+='<h4>'+escape(row['name'])+'</h4><p>'+escape(row['body']).replace('\n','<br>')+'</p>'
-            if not incidents and tone=='ok':text+='<p>公开状态页未报告异常。</p>'
+            if not incidents and tone=='ok':text+='<p>公开状态页未报告 Codex 异常。</p>'
             text+='<p style="color:'+theme['muted']+'">公开状态与本机会话速率分别统计。这里可查看服务进展，具体会话表现见速率列表。</p><p style="color:'+theme['muted']+'">来源 status.openai.com</p>'
             self.doc.setDefaultFont(font(11));self.doc.setDefaultStyleSheet('body{color:'+theme['ink']+'}h3{font-size:12px;font-weight:600;margin:5px 0}h4{font-size:11px;margin:8px 0 3px}p{margin:5px 0;line-height:135%}')
             self.doc.setHtml('<body>'+text+'</body>');self.doc.setTextWidth(self.width_limit-22)
@@ -78,15 +79,21 @@ def service_bubble(Base):
             if event.button()!=Qt.MouseButton.LeftButton:return
             if not self.focusable:return
             if self.page=='sessions' and event.position().y()>=self.height()-29:self.page='service';self.detail_scroll=0
-            elif self.page=='service' and event.position().y()<30:
-                if event.position().x()>self.width()-30:self.dismiss(True);return
+            elif self.page=='service' and event.position().y()<30 and event.position().x()<110:
                 self.page='sessions'
             else:return
             if self.host:self.inspect(dict(details=self.rows,rate=self.total),self.host)
         def hideEvent(self,event):
             self.geometry_motion.stop();super().hideEvent(event)
         def event(self,event):
-            if event.type()==QEvent.Type.WindowDeactivate and getattr(self,'focusable',False):self.dismiss(True)
+            if event.type()==QEvent.Type.WindowDeactivate and getattr(self,'focusable',False):
+                from shiboken6 import isValid
+                host=getattr(self,'host',None)
+                if host is not None and isValid(host) and host.isVisible() and QRect(host.mapToGlobal(QPoint()),host.size()).contains(QCursor.pos()):
+                    # Windows may deactivate this Tool before delivering the
+                    # host's press. Carry that one click across the focus loss.
+                    host._service_deactivated_at=time.monotonic()
+                self.dismiss(True)
             return super().event(event)
         def paintEvent(self,event):
             if self.page=='sessions':
@@ -94,11 +101,13 @@ def service_bubble(Base):
                 p=QPainter(self);p.setRenderHint(QPainter.RenderHint.Antialiasing);p.setOpacity(self.level);theme=palette();y=self.height()-29
                 p.fillRect(QRectF(2,y,self.width()-4,23),QColor(theme['surface']));p.setPen(QColor(theme['border']));p.drawLine(10,y,self.width()-10,y)
                 value=self.service.value;ink,dot=service_colors(theme,value['tone']);p.setFont(font(11));p.setPen(QColor(theme['muted']));p.drawText(11,y+18,'服务')
-                p.setPen(Qt.PenStyle.NoPen);p.setBrush(QColor(dot));p.drawEllipse(QRectF(43,y+10,5,5));p.setPen(QColor(ink));p.drawText(54,y+18,value['title'])
+                baseline=y+18
+                center=baseline+QFontMetricsF(p.font(),p.device()).tightBoundingRect(value['title']).center().y()+.5
+                p.setPen(Qt.PenStyle.NoPen);p.setBrush(QColor(dot));p.drawEllipse(QRectF(43,center-2.5,5,5));p.setPen(QColor(ink));p.drawText(54,baseline,value['title'])
                 checked=value.get('checked');stamp=datetime.fromtimestamp(checked).strftime('%H:%M') if checked else '未更新'
                 p.setPen(QColor(theme['muted']));p.drawText(QRectF(self.width()-80,y+2,69,22),Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter,stamp+(' ›' if self.focusable else ''));return
             theme=palette();p=QPainter(self);p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source);p.fillRect(self.rect(),Qt.GlobalColor.transparent);p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver);p.setOpacity(self.level);p.setRenderHint(QPainter.RenderHint.Antialiasing)
             p.setPen(QColor(theme['border']));p.setBrush(QColor(theme['surface']));p.drawRoundedRect(QRectF(1,1,self.width()-2,self.height()-2),9,9)
-            p.setFont(font(11));p.setPen(QColor(theme['accentText']));p.drawText(11,21,'‹ 会话速率');p.drawText(self.width()-23,21,'×')
+            p.setFont(font(11));p.setPen(QColor(theme['accentText']));p.drawText(11,21,'‹ 会话速率')
             p.setClipRect(QRectF(10,29,self.width()-20,self.height()-35));p.translate(10,29-self.detail_scroll);self.doc.drawContents(p)
     return SessionRateBubble

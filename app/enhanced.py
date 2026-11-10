@@ -1,4 +1,6 @@
 """Bailong desktop companion with Codex status and account data."""
+from storage_locations import configure_data_environment
+configure_data_environment()
 from theme_registry import color as theme_color
 import ctypes
 import json
@@ -18,6 +20,10 @@ if __name__=='__main__' and '--cleanup-storage-migration' in sys.argv:
 if __name__=='__main__' and '--watch-codex' in sys.argv:
     from codex_startup import main as watch_codex
     raise SystemExit(watch_codex())
+
+from bundled_tls import OPENSSL_DLLS, check_startup as check_bundled_tls
+if __name__=='__main__' and not check_bundled_tls():
+    raise SystemExit(1)
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPoint, QRectF, QUrl
 from PySide6.QtGui import QIcon, QPainter, QPixmap, QCursor, QFontDatabase, QDesktopServices, QColor, QPen
@@ -53,6 +59,8 @@ class ActivityThread(QThread):
         from wsl_codex import state_dir
         self.wsl=is_wsl_source(self.tail.home);self.session_dir=state_dir(STATE_DIR,self.tail.home)
         self.token_index=TokenUsageIndex(STATE_DIR/'token-usage.sqlite3',home);self.last_token_scan=0;self.token_wake=threading.Event();self.token_reader=None
+        from live_today import LiveTodayTotal
+        self.today_total=LiveTodayTotal(self.token_index.path);self.tail.usage_observer=self.today_total.ingest;self.last_live_today=None
         self.week_cycle=None
         self.token_runs=RefreshRuns()
         self.last_presence_scan=0;self.presence_reader=None;self.desktop_open=None;self.last_read_scan=0;self.seed_status_sent=False;self.last_name_scan=-10;self.conversation_names={}
@@ -104,6 +112,9 @@ class ActivityThread(QThread):
                 with self.context_lock:displayed=self.displayed;visited=self.visited
                 self.targets.sync(self.tail.reducer.sessions,pending,displayed,visited)
                 self.tail.set_pins(self.targets.pinned());batch=self.tail.poll()
+                live_today=self.today_total.snapshot()
+                if live_today is not None and live_today!=self.last_live_today:
+                    self.last_live_today=live_today;self.event.emit(dict(kind='live_today_tokens',value=live_today))
                 live_rate=self.output_rate.snapshot()
                 for item in live_rate['details']:
                     record=self.tail.reducer.sessions.get(item['session'])
@@ -116,7 +127,7 @@ class ActivityThread(QThread):
                     batch.extend(e for e in seeds if not states.get(session_id(e['session']),Session()).done)
                 self.targets.sync(self.tail.reducer.sessions,pending,displayed,visited)
                 if history_due and not self.wsl:
-                    unfinished={session_id(sid):s.turn for sid,s in self.tail.reducer.sessions.items() if not s.done and not s.source_subagent and s.turn}
+                    unfinished={session_id(sid):s.turn for sid,s in self.tail.reducer.sessions.items() if not s.done and not s.source_hidden and s.turn}
                     ids=self.targets.choose('terminal',128,unfinished)
                     for sid,turn,status in terminal_conversations(self.tail.home,[(sid,unfinished[sid]) for sid in ids]):
                         batch.extend(self.tail.reducer.terminate(self.targets.alias(sid),status,turn))
@@ -201,6 +212,7 @@ class ActivityThread(QThread):
             options=dict(stop=self.stop.is_set)
             if cycle:options['cycle']=cycle
             snapshot=self.token_index.poll(**options)
+            self.today_total.reconcile(snapshot);snapshot['_live_today']=self.today_total.snapshot()
             if (snapshot.get('quota_history') or {}).get('pending'):
                 # Bound each import slice and allow the UI/status worker to run.
                 # Continue in five seconds without adding a GUI timer or scanner.
@@ -293,9 +305,17 @@ class ResetThread(QThread):
 from compact_bubble import CompactBubble as HeadBubble
 
 class EnhancedPet(Pet):
+    @staticmethod
+    def read_settings(path):
+        try:
+            values=json.loads(path.read_text(encoding='utf-8'))
+            if not isinstance(values,dict):raise ValueError('invalid settings')
+            return values,False
+        except FileNotFoundError:return {},False
+        except (OSError,ValueError,RecursionError):return {},True
+
     def __init__(self,monitor=True):
-        try:self.settings=json.loads(CONFIG.read_text(encoding='utf-8'))
-        except (OSError,ValueError):self.settings={}
+        self.settings,self.settings_read_failed=self.read_settings(CONFIG)
         self.enhanced_ready=False
         super().__init__()
         self.setWindowTitle('白龙桌宠增强版')
@@ -407,10 +427,14 @@ class EnhancedPet(Pet):
             QTimer.singleShot(1800,self.refresh_quota)
         self.position_bubble()
 
-    def save_settings(self):
+    def collect_settings(self):
         self.settings.update(wandering=self.wandering,random_actions=self.random_actions,
                              commentary=self.commentary,sound=self.sound,bubble=self.bubble.enabled,
                              quota_visible=self.bubble.show_quota,position=[self.x(),self.y()])
+
+    def save_settings(self):
+        if self.settings_read_failed:return False
+        self.collect_settings()
         save_json(CONFIG,self.settings)
 
     def say(self,text,ms=4000):
@@ -695,6 +719,7 @@ class EnhancedPet(Pet):
                 self.bubble.set_token_busy(event['busy'])
         elif kind=='database_maintenance':
             self.database_maintenance=event['value']
+        elif kind=='live_today_tokens':self.bubble.set_live_today(event['value'])
         elif kind=='live_output_rate':
             self.bubble.live_output_rate=event['value']
             card=getattr(self.bubble,'live_rate_card',None)
@@ -703,6 +728,7 @@ class EnhancedPet(Pet):
                 if isValid(card):card.set_data(event['value'])
         elif kind=='token_usage':
             snapshot=event['snapshot']
+            self.bubble.set_live_today(snapshot.get('_live_today'),refresh=False)
             if snapshot.get('unavailable') and self.bubble.token_snapshot:
                 snapshot=dict(self.bubble.token_snapshot,partial=True,refresh_failed=True)
             self.bubble.token_snapshot=snapshot;self.bubble.redraw();self.position_bubble()
@@ -995,6 +1021,36 @@ def main():
                 import ssl
                 context=ssl.create_default_context()
                 result=dict(state='available',code='ok',contextReady=True,certificateVerification=context.verify_mode==ssl.CERT_REQUIRED,hostnameVerification=context.check_hostname,readOnly=True,offline=True)
+                if sys.platform=='win32' and getattr(sys,'frozen',False):
+                    from PySide6.QtCore import QCoreApplication
+                    from PySide6.QtNetwork import QSslSocket
+                    import psutil
+                    application=QCoreApplication.instance() or QCoreApplication([])
+                    if not QSslSocket.setActiveBackend('openssl') or not QSslSocket.supportsSsl():
+                        raise RuntimeError('Qt OpenSSL backend did not initialize')
+                    names=set(OPENSSL_DLLS)
+                    expected={Path(sys.executable).resolve().parent/name for name in names}
+                    loaded={Path(m.path).resolve() for m in psutil.Process().memory_maps()
+                            if Path(m.path).name.lower() in names}
+                    if loaded!=expected:
+                        raise RuntimeError('Qt/Python loaded OpenSSL outside the application directory')
+                    result['bundledQtOpenSsl']=True
+                    conflict=os.environ.get('BAILONG_TLS_TEST_CONFLICT_DIR')
+                    if conflict:
+                        entries=[Path(entry).resolve() for entry in os.environ.get('PATH','').split(os.pathsep) if entry]
+                        # PyInstaller and PySide6 prepend bundled directories.
+                        # None of those may contain another OpenSSL copy.
+                        internal=Path(sys._MEIPASS).resolve()
+                        first_external=None
+                        for entry in entries:
+                            if not entry.is_relative_to(internal):
+                                first_external=entry
+                                break
+                            if any((entry/name).exists() for name in OPENSSL_DLLS):
+                                raise RuntimeError('Unexpected duplicate OpenSSL DLL in bundled PATH')
+                        if first_external!=Path(conflict).resolve():
+                            raise RuntimeError('OpenSSL conflict directory is not the first external PATH entry')
+                        result['externalOpenSslFirstInPath']=True
             else:
                 feed=fetch_feed();result=dict(state='available',code='ok',events=len(feed['events']),scheduled=feed['scheduled'],seconds=round(time.monotonic()-started,3),readOnly=True)
         except Exception as error:result=reset_failure(error)
