@@ -1,7 +1,7 @@
 """Incremental analytics metadata; store identifiers and counters, never prose."""
 import hashlib,json,math
 from datetime import date,datetime,timedelta
-from token_calendar import counter
+from token_calendar import counter,daily_bucket_size
 
 UNKNOWN='未识别模型'
 
@@ -209,30 +209,52 @@ def scan_file(index,db,path,stop):
     index.format_known[key]=recognized
     return recognized
 
-def report_snapshot(db,now):
+def daily_model_rows(db,start,end,include_end=False):
+    upper='<=' if include_end else '<'
+    lower='stamp>=? AND ' if start is not None else ''
+    args=(start,end) if start is not None else (end,)
+    return db.execute(f"SELECT date(stamp,'unixepoch','localtime'),model,SUM(tokens),SUM(input_tokens),SUM(output_tokens),MIN(known) FROM usage WHERE {lower}stamp{upper}? GROUP BY 1,2 ORDER BY 1,2",args).fetchall()
+
+
+def hourly_usage(db,start,end,include_end=False):
+    upper='<=' if include_end else '<'
+    hours=[0]*24
+    models=[{} for _ in hours]
+    for hour,model,total in db.execute(
+        f"SELECT strftime('%H',stamp,'unixepoch','localtime'),model,SUM(tokens) FROM usage WHERE stamp>=? AND stamp{upper}? GROUP BY 1,2",
+        (start,end)):
+        slot=int(hour);name=model or UNKNOWN
+        hours[slot]+=total
+        models[slot][name]=models[slot].get(name,0)+total
+    return hours,models
+
+
+def report_snapshot(db,now,rows=None):
     current=datetime.fromtimestamp(now);end=current.replace(hour=0,minute=0,second=0,microsecond=0);start=end-timedelta(days=1)
-    rows=list(db.execute("SELECT date(stamp,'unixepoch','localtime'),model,SUM(tokens),SUM(input_tokens),SUM(output_tokens),MIN(known) FROM usage WHERE stamp<=? GROUP BY 1,2 ORDER BY 1,2",(now,)))
+    if rows is None:rows=daily_model_rows(db,None,now,include_end=True)
     daily=[dict(day=d,model=m or UNKNOWN,total=t,input=i,output=o,known=bool(k)) for d,m,t,i,o,k in rows]
     model_totals={}
     for r in daily:model_totals[r['model']]=model_totals.get(r['model'],0)+r['total']
     sessions=db.execute("SELECT COUNT(DISTINCT session) FROM usage WHERE stamp<=? AND session!=''",(now,)).fetchone()[0]
     messages=db.execute('SELECT COUNT(*) FROM messages WHERE stamp>=? AND stamp<?',(start.timestamp(),end.timestamp())).fetchone()[0]
-    hours=[0]*24
-    for h,t in db.execute("SELECT strftime('%H',stamp,'unixepoch','localtime'),SUM(tokens) FROM usage WHERE stamp>=? AND stamp<? GROUP BY 1",(start.timestamp(),end.timestamp())):hours[int(h)]=t
+    hours,hour_models=hourly_usage(db,start.timestamp(),end.timestamp())
     total=sum(r['total'] for r in daily)
-    return dict(day=start.strftime('%Y-%m-%d'),hours=hours,daily_models=daily,
+    return dict(day=start.strftime('%Y-%m-%d'),hours=hours,hour_models=hour_models,daily_models=daily,
                 sessions=sessions,active_days=len({r['day'] for r in daily}),all_total=total,
                 favorite_model=max(model_totals,key=model_totals.get) if model_totals else '暂无记录',
                 messages=messages,yesterday_total=sum(hours),peak_hour=max(range(24),key=lambda h:hours[h]) if any(hours) else None,
                 metadata_incomplete=bool(db.execute("SELECT 1 FROM usage WHERE stamp<=? AND (session='' OR model=?) LIMIT 1",(now,UNKNOWN)).fetchone()))
 
-def model_series(report,period='7d'):
+def model_series(report,period='7d',bounds=None):
     report=report or {};end=report.get('day',datetime.now().strftime('%Y-%m-%d'))
     last=datetime.strptime(end,'%Y-%m-%d').date();rows=[r for r in report.get('daily_models',[]) if r['day']<=end]
-    first=min((r['day'] for r in rows),default=end) if period=='all' else (last-timedelta(days=29 if period=='30d' else 6)).isoformat()
-    rows=[r for r in rows if r['day']>=first];totals={}
+    if bounds:
+        first=bounds[0].isoformat()
+        last=bounds[1];end=last.isoformat()
+    else:first=min((r['day'] for r in rows),default=end) if period=='all' else (last-timedelta(days=29 if period=='30d' else 6)).isoformat()
+    rows=[r for r in rows if first<=r['day']<=end];totals={}
     first_day=datetime.strptime(first,'%Y-%m-%d').date()
-    span=(last-first_day).days+1;step=max(1,math.ceil(span/24)) if period=='all' else 1
+    span=(last-first_day).days+1;step=daily_bucket_size(span,period)
     bins=[];cursor=first_day
     while cursor<=last:
         end_day=min(last,cursor+timedelta(days=step-1))
@@ -240,16 +262,25 @@ def model_series(report,period='7d'):
         cursor=end_day+timedelta(days=1)
     # Assign each row once. The previous nested scan reformatted two dates for
     # every row in every bin, blocking the GUI on large local histories.
-    day_bins={}
+    day_bins={};daily_usage={}
     for r in rows:
         m=totals.setdefault(r['model'],dict(model=r['model'],total=0,input=0,output=0,known=True))
         m['total']+=r['total'];m['input']+=r['input'] or 0;m['output']+=r['output'] or 0;m['known']&=r['known']
         day=r['day']
         if day not in day_bins:day_bins[day]=(date.fromisoformat(day)-first_day).days//step
+        daily=daily_usage.setdefault(day,{})
+        daily[r['model']]=daily.get(r['model'],0)+r['total']
         bucket=bins[day_bins[day]];values=bucket['values']
         values[r['model']]=values.get(r['model'],0)+r['total'];bucket['total']+=r['total']
     models=sorted(totals.values(),key=lambda m:(-m['total'],m['model']));total=sum(m['total'] for m in models)
-    return dict(models=models,bins=bins,total=total,start=first,end=end)
+    peak=None;model_peaks={}
+    for daily in daily_usage.values():
+        amount=sum(daily.values())
+        peak=amount if peak is None else max(peak,amount)
+        for model,value in daily.items():model_peaks[model]=max(value,model_peaks.get(model,0))
+    through=min(end,report.get('day',end))
+    days=max(1,(date.fromisoformat(through)-first_day).days+1)
+    return dict(models=models,bins=bins,total=total,start=first,end=end,through=through,days=days,peak=peak,model_peaks=model_peaks)
 
 def token_analogy(total,index=0):
     from book_reference import analogy

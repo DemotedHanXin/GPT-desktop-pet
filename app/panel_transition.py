@@ -26,7 +26,9 @@ def settle_visible(root):
     isVisibleTo ignores the deliberately hidden root used during preparation,
     while rejecting explicitly hidden descendants and their entire subtrees.
     """
+    from theme_runtime import prepare_theme_widget
     widgets=[root]+[w for w in root.findChildren(QWidget) if w.isVisibleTo(root)]
+    for widget in widgets:prepare_theme_widget(widget)
     for widget in reversed(widgets):
         widget.ensurePolished()
         if widget.layout():widget.layout().activate()
@@ -73,8 +75,8 @@ class NativeLanding(QWidget):
         if preserve_layered_style(self,event_type,message):return True,0
         return super().nativeEvent(event_type,message)
     def prepare(self,rect):
-        top=bool(self.parentWidget().windowFlags()&Qt.WindowType.WindowStaysOnTopHint)
-        if bool(self.windowFlags()&Qt.WindowType.WindowStaysOnTopHint)!=top:self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint,top)
+        from surface_policy import card_layer,update_qt_layer
+        if not self.isVisible():update_qt_layer(self,card_layer(self.parentWidget()))
         # Expose an empty, input-transparent surface during the animation.
         # A first show at the final resize may not be paintable synchronously.
         if self.geometry()!=rect:self.setGeometry(rect)
@@ -240,7 +242,8 @@ class PanelTransition(QObject):
             b.setFixedSize(target.size());b.move(target.topLeft());b.content.setVisible(b.isVisible());self.cover.hide()
             self.cover.image=None;self.cover.next_image=None;self.cover.blend=0.
             if b.report:b.report.follow.finish(target)
-            self.before=None;self.start_rect=None;self.old_surface=None;self.start_page_state=None;self.deferred=False;self.preparing=False;self._end_preparation();self._hold_icon(False);return
+            self.before=None;self.start_rect=None;self.old_surface=None;self.start_page_state=None;self.deferred=False;self.preparing=False;self._end_preparation();self._hold_icon(False)
+            b._refresh_today();return
         self.target_rect=target;b.layout.activate()
         # Let hidden target children run their normal Show/layout preparation
         # under the frozen native canvas. QTabWidget defers its internal pane
@@ -268,7 +271,10 @@ class PanelTransition(QObject):
         image=complete_frame(b)
         self.cover.image=image
         self.cover.next_image=None;self.cover.blend=0.
-        self.morph=SurfaceMorph(self.old_surface,SurfaceState.capture(b,target.topLeft(),frame=image,content=image))
+        translation_only=(target.size()==self.start_rect.size() and self._page_state()==self.start_page_state
+                          and b.panel_page=='status' and not b.expanded and not b.is_compact())
+        self.morph=SurfaceMorph(self.old_surface,SurfaceState.capture(b,target.topLeft(),frame=image,content=image),
+                                translation_only=translation_only)
         b.layout.setEnabled(False)
         self.frozen=[(b.layout.itemAt(i).widget(),b.layout.itemAt(i).widget().updatesEnabled()) for i in range(b.layout.count()) if b.layout.itemAt(i).widget()]
         for widget,enabled in self.frozen:widget.setUpdatesEnabled(False)
@@ -394,6 +400,7 @@ class PanelTransition(QObject):
             if guarded:self.post_handoff=refresh
             else:refresh()
     def start_reveals(self):
+        self.bubble._refresh_today()
         for widget in self.bubble.content.findChildren(QWidget):
             if widget.isVisible() and hasattr(widget,'start_reveal'):widget.start_reveal()
     def release_landing(self):
@@ -450,3 +457,4 @@ class PanelTransition(QObject):
             if self.bubble.isVisible():self.bubble.content.show()
         self._end_preparation()
         if self.landing.image is None:self._hold_icon(False)
+        if self.bubble.isVisible():self.bubble._refresh_today()

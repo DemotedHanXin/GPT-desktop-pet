@@ -6,6 +6,7 @@ import math
 import os
 import sqlite3
 import time
+from collections import deque
 from contextlib import closing
 from datetime import datetime,timedelta
 from pathlib import Path
@@ -41,6 +42,9 @@ class TokenUsageIndex:
         from log_catalog import LogCatalog
         self.catalog=LogCatalog(self.home)
         self._maintenance=None;self._maintenance_result=None
+        self._closed_days=None
+        self._scan_queue=deque()
+        self._scan_counts=(0,0,0)
 
     def prepare(self,stop=lambda:False):
         """Called by the one index worker before it opens a writable connection."""
@@ -110,19 +114,41 @@ class TokenUsageIndex:
         from token_analytics import scan_file
         return scan_file(self,db,path,stop)
 
-    def poll(self,now=None,stop=lambda:False,cycle=None):
+    def poll(self,now=None,stop=lambda:False,cycle=None,scan_seconds=.35,calendar_range=None):
         from performance_metrics import METRICS
-        files=self.catalog.discover(check=True);errors=self.catalog.errors;readable=0;schema_errors=0
+        from token_analytics import daily_model_rows
+        now=time.time() if now is None else now
+        midnight=datetime.fromtimestamp(now).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
+        files=self.catalog.discover(check=True)
         self.project_files=tuple(files)
+        queue=deque(self._scan_queue or sorted(files))
+        errors,readable,schema_errors=self._scan_counts if self._scan_queue else (self.catalog.errors,0,0)
+        closed_days=self._closed_days
+        if closed_days and closed_days[2]!=self._index_signature():closed_days=None
+        # Publish the cache only after the index transaction commits.
+        self._closed_days=None
         with closing(self.connect()) as db, db:
-            for path in sorted(files):
-                if stop():break
+            self._watch_closed_days(db,midnight)
+            deadline=time.monotonic()+scan_seconds
+            def pause():return stop() or time.monotonic()>=deadline
+            while queue and not pause():
+                path=queue.popleft()
+                if path not in files:continue
                 try:
-                    with METRICS.span('token_scan_file'):known=self.scan_file(db,path,stop)
+                    with METRICS.span('token_scan_file'):known=self.scan_file(db,path,pause)
+                    if pause():
+                        queue.append(path)
+                        break
                     if known is False:errors+=1;schema_errors+=1
                     else:readable+=1
                 except OSError:errors+=1
-            result=self.snapshot(db,now,errors);result.update(log_files=len(files),readable_files=readable,format_unknown=bool(schema_errors))
+            pending=bool(queue)
+            dirty=db.execute('SELECT changed FROM token_closed_days_changed').fetchone()[0]
+            if not closed_days or closed_days[0]!=midnight or dirty:
+                closed_days=(midnight,daily_model_rows(db,None,midnight))
+            rows=closed_days[1]+daily_model_rows(db,midnight,now,include_end=True)
+            result=self.snapshot(db,now,errors,rows);result.update(log_files=len(files),readable_files=min(readable,len(files)),format_unknown=bool(schema_errors),scan_pending=pending)
+            if pending:result['partial']=True
             if self.legacy_import_pending:
                 result['partial']=True
                 result['legacy_migration_pending']=True
@@ -141,18 +167,35 @@ class TokenUsageIndex:
                 readable>0 and not result['partial'] and not result.get('unavailable'),progress)
             from project_cost import update as update_projects,snapshot as project_snapshot
             project_progress=update_projects(db,files,stop)
-            result['projects']=project_snapshot(db,time.time() if now is None else now,project_progress,files,self.home)
+            result['projects']=project_snapshot(db,now,project_progress,files,self.home,calendar_range)
             from rate_index import update as rate_update,snapshot as rate_snapshot
             rate_progress=rate_update(db,files,stop)
-            result['rates']=rate_snapshot(db,time.time() if now is None else now,rate_progress)
+            result['rates']=rate_snapshot(db,time.time() if now is None else now,rate_progress,include_output=True)
             if result['report']:result['report']['rates']=result['rates']
-            return result
+        self._closed_days=(*closed_days[:2],self._index_signature())
+        self._scan_queue=queue;self._scan_counts=(errors,readable,schema_errors)
+        return result
+
+    def _index_signature(self):
+        from log_catalog import LogCatalog
+        return tuple(LogCatalog.signature(path) for path in (self.path,self.path.with_name(self.path.name+'-wal')))
+
+    @staticmethod
+    def _watch_closed_days(db,midnight):
+        db.execute('CREATE TEMP TABLE token_closed_days_changed (changed INTEGER)')
+        db.execute('INSERT INTO token_closed_days_changed VALUES(0)')
+        for event,condition in (
+            ('INSERT',f'NEW.stamp<{midnight}'),
+            ('UPDATE',f'OLD.stamp<{midnight} OR NEW.stamp<{midnight}'),
+            ('DELETE',f'OLD.stamp<{midnight}'),
+        ):
+            db.execute(f'CREATE TEMP TRIGGER token_history_{event} AFTER {event} ON main.usage WHEN {condition} BEGIN UPDATE token_closed_days_changed SET changed=1 WHERE changed=0; END')
 
     def rate_step(self,stop=lambda:False):
         from rate_index import update,snapshot
         with closing(sqlite3.connect(self.path,timeout=.5)) as db,db:
             progress=update(db,self.project_files,stop)
-            return snapshot(db,time.time(),progress)
+            return snapshot(db,time.time(),progress,include_output=True)
 
     def project_step(self,stop=lambda:False):
         """Continue only the cost index; leave Token/quota history scans alone."""
@@ -160,30 +203,35 @@ class TokenUsageIndex:
         with closing(sqlite3.connect(self.path,timeout=.5)) as db, db:
             return update(db,self.project_files,stop,budget=.15)
 
-    def project_snapshot(self,progress):
+    def project_snapshot(self,progress,calendar_range=None):
         from project_cost import snapshot
         with closing(sqlite3.connect(self.path,timeout=.5)) as db, db:
-            return snapshot(db,time.time(),progress,self.project_files,self.home)
+            return snapshot(db,time.time(),progress,self.project_files,self.home,calendar_range)
 
-    def snapshot(self,db,now=None,errors=0):
+    def snapshot(self,db,now=None,errors=0,model_rows=None):
         now=time.time() if now is None else now;start,end=month_bounds(now)
         days={f'{start:%Y-%m}-{day:02}':0 for day in range(1,calendar.monthrange(start.year,start.month)[1]+1)}
-        history=dict(db.execute("SELECT date(stamp,'unixepoch','localtime'),SUM(tokens) FROM usage WHERE stamp<=? GROUP BY date(stamp,'unixepoch','localtime')",(now,)))
+        from token_analytics import hourly_usage,report_snapshot
+        report=report_snapshot(db,now,model_rows)
+        history={}
+        for row in report['daily_models']:
+            day=row['day'];history[day]=history.get(day,0)+row['total']
         for day,value in history.items():
             if day in days:days[day]=value
         current=datetime.fromtimestamp(now);midnight=current.replace(hour=0,minute=0,second=0,microsecond=0)
-        hours=[0]*24
-        for hour,value in db.execute("SELECT strftime('%H',stamp,'unixepoch','localtime'),SUM(tokens) FROM usage WHERE stamp>=? AND stamp<=? GROUP BY strftime('%H',stamp,'unixepoch','localtime')",(midnight.timestamp(),now)):
-            hours[int(hour)]=value
-        from token_analytics import report_snapshot
+        hours,hour_models=hourly_usage(db,midnight.timestamp(),now,include_end=True)
         return {'_usage_rowid':db.execute('SELECT COALESCE(MAX(rowid),0) FROM usage').fetchone()[0],
-                'report':report_snapshot(db,now),'month':start.strftime('%Y-%m'),'days':days,'total':sum(days.values()),
+                'report':report,'month':start.strftime('%Y-%m'),'days':days,'total':sum(days.values()),
                 'history_days':history,'history_start':min(history,default=None),'all_total':sum(history.values()),
-                'today':current.strftime('%Y-%m-%d'),'hours':hours,
+                'today':current.strftime('%Y-%m-%d'),'hours':hours,'hour_models':hour_models,
                 'checked':now,'partial':bool(errors),'source':'本机 Codex 日志'}
 
 
 TOKEN_RANGES=('all','30d','7d','day')
+DAILY_BUCKET_LIMIT=24
+
+def daily_bucket_size(days,period):
+    return max(1,math.ceil(days/DAILY_BUCKET_LIMIT)) if period=='all' else 1
 
 def usage_series(snapshot,period='30d',now=None):
     """Bounded daily bars or hourly consumption, with honest future/empty slots."""
@@ -192,9 +240,11 @@ def usage_series(snapshot,period='30d',now=None):
     bins=[];available=bool(snapshot) and not snapshot.get('unavailable')
     if period=='day':
         values=snapshot.get('hours') or [];available=available and snapshot.get('today')==today.isoformat() and len(values)==24
+        models=snapshot.get('hour_models') or []
         for hour in range(24):
             value=counter(values[hour]) if available else 0
             bins.append(dict(label=f'{hour:02}:00–{hour+1:02}:00',value=value or 0,
+                             models=models[hour] if available and hour<len(models) else {},
                              future=hour>current.hour,current=hour==current.hour,start=hour,end=hour))
         return dict(mode='line',period=period,title='今日',bins=bins,total=sum(b['value'] for b in bins if not b['future']),
                     available=available,start=today.isoformat(),end=today.isoformat())
@@ -204,13 +254,21 @@ def usage_series(snapshot,period='30d',now=None):
         except (ValueError,TypeError):continue
         if day<=today and counter(value) is not None:clean[day]=value
     start=min(clean,default=today) if period=='all' else today-timedelta(days=29 if period=='30d' else 6)
-    span=(today-start).days+1;step=max(1,math.ceil(span/24)) if period=='all' else 1
+    span=(today-start).days+1;step=daily_bucket_size(span,period)
+    day_models={}
+    if period=='7d':
+        first_day,last_day=start.isoformat(),today.isoformat()
+        for row in (snapshot.get('report') or {}).get('daily_models',[]):
+            if first_day<=row['day']<=last_day:
+                models=day_models.setdefault(row['day'],{})
+                models[row['model']]=models.get(row['model'],0)+row['total']
     cursor=start
     while cursor<=today:
         last=min(today,cursor+timedelta(days=step-1))
         value=sum(clean.get(cursor+timedelta(days=i),0) for i in range((last-cursor).days+1))
         label=str(cursor) if cursor==last else f'{cursor} 至 {last}'
-        bins.append(dict(start=cursor.isoformat(),end=last.isoformat(),label=label,value=value,current=last==today,future=False))
+        models=day_models.get(str(cursor),{})
+        bins.append(dict(start=cursor.isoformat(),end=last.isoformat(),label=label,value=value,models=models,current=last==today,future=False))
         cursor=last+timedelta(days=1)
     return dict(mode='bars',period=period,title={'all':'全部','30d':'30天','7d':'7天'}[period],bins=bins,
                 total=sum(b['value'] for b in bins),available=available,start=start.isoformat(),end=today.isoformat(),bucket_days=step)

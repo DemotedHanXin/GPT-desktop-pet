@@ -12,9 +12,10 @@ from chart_reveal import RasterChart,ChartReveal,bar_shape
 from rate_chart import ComboChart
 from choice_controls import ChoiceCombo
 from settings_controls import motion_enabled
-from card_motion import AnimatedDisclosure
 from project_cost_ui import ExplanationOverlay
-from quota_history import capacity_reference
+from quota_history import capacity_reference,current_reference,cycle_label,REFERENCE_BADGE_MIN,REFERENCE_BADGE_DROP,STRICT_BADGE_REMAINING
+from report_metrics import ReportMetricPair
+from report_dates import quota_text
 
 
 def date_text(stamp):
@@ -122,8 +123,23 @@ class CyclePlot(QWidget,RasterChart,ComboChart):
 
 
 class CycleChoice(ChoiceCombo):
+    calendarRequested=Signal()
+    calendar_enabled=False
     title='选择额度周期'
     def display_text(self):return self.title
+    def showPopup(self):
+        if self.count() and self.isEnabled():
+            if self.calendar_enabled:self.calendarRequested.emit()
+            else:super().showPopup()
+    def paintEvent(self,event):
+        p=QPainter(self);p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor(theme_color(PANEL)));p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0,1,0,-1),7,7)
+        p.setFont(font(11));p.setPen(QColor(theme_color(INK if self.isEnabled() else MUTED)))
+        self.draw_caption(p,self.rect().adjusted(13,0,-13,0),Qt.AlignmentFlag.AlignCenter,self.title)
+        x=self.width()-8;y=self.height()/2
+        p.setPen(Qt.PenStyle.NoPen);p.setBrush(QColor(theme_color(MUTED)))
+        p.drawPolygon(QPolygonF([QPointF(x-3,y-2),QPointF(x+3,y-2),QPointF(x,y+2)]))
 
 
 def cycle_messages(c,history,previous=None):
@@ -137,6 +153,7 @@ def cycle_messages(c,history,previous=None):
     elif c.get('rise_pending'):estimate_note='额度回升待确认'
     elif c.get('corrected'):estimate_note='额度读数曾回升，暂停估算'
     elif estimate:estimate_note='每 1% ≈ '+compact_tokens(round(c['per_percent']))+' Token' if c.get('per_percent') else '基于本机额度与 Token 记录估算'
+    elif c.get('reference_total'):estimate_note='已有初步参考，额度再下降一些后可估算总量'
     elif drop<5:
         estimate_note=(f'再观察 {5-drop:g} 个百分点可估算总量' if not c['closed'] else f'仅观察 {drop:g} 个百分点，未达估算门槛')
     else:estimate_note='缺少有效 Token 记录，暂不估算'
@@ -164,10 +181,10 @@ def cycle_messages(c,history,previous=None):
         else:reason=c['comparison_block'].split('，暂不判断涨跌')[0]+'。'
     elif c.get('change') is not None:
         change=c['change'];title=('推测容量减少 ' if change<0 else '推测容量增加 ' if change>0 else '推测容量基本持平')+(f'{abs(change):.1f}%' if change else '')
-        reason='相近使用条件下对照上一周期。'
+        reason=(c.get('comparison_reason') or '相近使用条件下对照上一周期')+'。'
     elif not estimate:title='有效用量不足';reason='缺少与额度读数对应的 Token，暂不能比较。'
     elif '套餐已变更' in c.get('comparison_reason',''):title='套餐变化，不直接比较';reason='改用当前套餐重新积累可比周期。'
-    else:title='上一周期暂不能用于比较';reason=c.get('comparison_reason') or '等待上一周期的有效记录。'
+    else:title='暂未找到可比周期';reason=c.get('comparison_reason') or '等待可比的历史记录。'
     if c.get('capacity_factor',1)>1:
         reason='本周期疑似扩容，已换算此前的额度读数。'+reason
     return dict(estimate=estimate_note,title=title,reason=reason,coverage=drop,show_coverage=show_coverage)
@@ -189,20 +206,18 @@ class QuotaCompareView(QWidget):
         self.previous.clicked.connect(lambda:self.choice.setCurrentIndex(self.choice.currentIndex()+1))
         self.next.clicked.connect(lambda:self.choice.setCurrentIndex(self.choice.currentIndex()-1))
         self.choice.currentIndexChanged.connect(self.select_current)
-        metrics,box=self.section('quota_current_section')
-        row=QHBoxLayout();row.setSpacing(8)
-        for title,name in [('已用 Token','used'),('估算容量','estimate')]:
-            column=QVBoxLayout();column.setSpacing(1);column.addWidget(text_label(title))
-            value=text_label('—',16,True);value.setObjectName('quota_cycle_'+name);setattr(self,name,value);column.addWidget(value);row.addLayout(column,1)
-        box.addLayout(row)
-        self.detail=text_label('',11,True);box.addWidget(self.detail)
-        self.estimate_hint=text_label();self.estimate_hint.setWordWrap(True);box.addWidget(self.estimate_hint);layout.addWidget(metrics)
+        self.metrics=ReportMetricPair(('已用 Token','估算容量'),'quota_current_section')
+        self.used,self.estimate=self.metrics.value_labels
+        self.used.setObjectName('quota_cycle_used');self.estimate.setObjectName('quota_cycle_estimate')
+        layout.addWidget(self.metrics)
+        self.estimate_hint=text_label();self.estimate_hint.setWordWrap(True);layout.addWidget(self.estimate_hint)
         comparison,box=self.section('quota_comparison_section')
         heading=text_label('周期容量对照',12);set_theme_style(heading,FONT_CSS+f'font-size:12px;font-weight:500;color:{PRIMARY};background:transparent;');box.addWidget(heading)
         self.capacity_pair=QWidget();pair=QHBoxLayout(self.capacity_pair)
         pair.setContentsMargins(0,0,0,0);pair.setSpacing(8)
         for title,name in [('本轮用法','current_capacity'),('上一轮用法','previous_capacity')]:
-            column=QVBoxLayout();column.setSpacing(1);column.addWidget(text_label(title))
+            column=QVBoxLayout();column.setSpacing(1);label=text_label(title);column.addWidget(label)
+            if name=='previous_capacity':self.baseline_title=label
             value=text_label('—',14,True);setattr(self,name,value);column.addWidget(value);pair.addLayout(column,1)
         box.addWidget(self.capacity_pair)
         self.reference=text_label('',12,True);self.reference.setObjectName('quota_reference_change');self.reference.setWordWrap(True);box.addWidget(self.reference)
@@ -221,28 +236,27 @@ class QuotaCompareView(QWidget):
         line.addWidget(self.legend);box.addLayout(line)
         self.plot=CyclePlot();self.plot.selected.connect(self.select_id);box.addWidget(self.plot);layout.insertWidget(layout.indexOf(comparison),chart)
         self.plot.hoverText.connect(self.show_plot_readout)
-        self.rules_button=QToolButton();self.rules_button.setText('估算与对比条件  ›');self.rules_button.setCheckable(True);self.rules_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.rules_button.setAccessibleName('展开估算与历史对比条件');set_theme_style(self.rules_button,'QToolButton{'+FONT_CSS+f'border:0;border-radius:6px;padding:4px 2px;color:{PRIMARY};font-size:11px;}}QToolButton:hover{{background:{PANEL};}}QToolButton:pressed{{background:{SELECTED};}}');layout.addWidget(self.rules_button,0,Qt.AlignmentFlag.AlignLeft)
-        rules=QWidget();box=QVBoxLayout(rules);box.setContentsMargins(0,0,0,0);box.setSpacing(6)
-        self.note=text_label('估算总量：已记录的额度下降达到 5 个百分点，且对应 Token 记录完整、额度新鲜、读数连续。');self.note.setWordWrap(True);box.addWidget(self.note)
-        conditions=text_label('仅对比上一周期：两轮均观察至少 20 个百分点、至少 3 个不同余额读数；同套餐与重置类型，且模型分布、缓存、输入输出、速度和推理档位接近。');conditions.setWordWrap(True);box.addWidget(conditions)
-        caveat=text_label('参考差异：两轮各按当轮用法估算容量，再计算差异。模型混用或档位记录缺失也可查看，差异不代表官方额度调整。同条件判断：满足上述条件时才判断容量涨跌。缺失档位保持未知，不按默认档位补齐。');caveat.setWordWrap(True);box.addWidget(caveat)
-        self.conditions=conditions;self.caveat=caveat
-        self.quality=text_label();self.quality.setWordWrap(True);box.addWidget(self.quality)
-        self.rules=AnimatedDisclosure(rules,background=PANEL);layout.addWidget(self.rules)
-        self.rules_button.toggled.connect(self.toggle_rules)
-        self.rates_button=QToolButton();self.rates_button.setText('官方 Credits 价表  ›');self.rates_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        set_theme_style(self.rates_button,'QToolButton{'+FONT_CSS+f'color:{PRIMARY};background:{PANEL};border:0;border-radius:6px;padding:5px;}}QToolButton:hover{{background:{SELECTED};}}')
-        self.rates_button.clicked.connect(self.show_rates);layout.addWidget(self.rates_button,0,Qt.AlignmentFlag.AlignLeft)
+        self.quality=''
+        self.actions=None
+    def more(self,anchor):
+        from project_cost_ui import CostActions
+        if self.actions is None:
+            self.actions=CostActions(anchor,(('估算与对比条件',self.show_rules),('官方 Credits 价表',self.show_rates)))
+            self.destroyed.connect(self.actions.deleteLater)
+        if self.actions.isVisible():self.actions.close()
+        else:self.actions.open()
+    def subpage_host(self):
+        ancestor=self.parentWidget()
+        while ancestor is not None:
+            if isinstance(ancestor,QScrollArea):return ancestor.viewport()
+            ancestor=ancestor.parentWidget()
+        return self
     def show_rates(self):
         from official_rates_ui import OfficialRatesPage
-        host=self
-        ancestor=self.parentWidget()
-        while ancestor:
-            if isinstance(ancestor,QScrollArea):host=ancestor.viewport();break
-            ancestor=ancestor.parentWidget()
+        host=self.subpage_host()
         page=next((p for p in host.findChildren(OfficialRatesPage) if not p.isHidden()),None)
         if page:page.raise_();return
+        for explanation in host.findChildren(ExplanationOverlay):explanation.close()
         self.rates_page=OfficialRatesPage(host)
     def show_plot_readout(self,value):
         self.plot.setAccessibleDescription(value)
@@ -250,19 +264,16 @@ class QuotaCompareView(QWidget):
         card=QWidget();card.setObjectName(name);set_theme_style(card,f'QWidget#{name}{{background:{PANEL if filled else "transparent"};border-radius:8px;}}')
         box=QVBoxLayout(card);box.setContentsMargins(8 if filled else 0,6 if filled else 0,8 if filled else 0,6 if filled else 0);box.setSpacing(3)
         return card,box
-    def toggle_rules(self,value):
-        self.rules_button.setText('估算与对比条件  ⌄' if value else '估算与对比条件  ›')
-        if not value:return
-        self.rules_button.setChecked(False)
-        host=self
-        ancestor=self.parentWidget()
-        while ancestor is not None:
-            if isinstance(ancestor,QScrollArea):host=ancestor.viewport();break
-            ancestor=ancestor.parentWidget()
+    def show_rules(self):
+        host=self.subpage_host()
+        if any(page.isVisible() for page in host.findChildren(ExplanationOverlay)):return
+        from official_rates_ui import OfficialRatesPage
+        for page in host.findChildren(OfficialRatesPage):page.close()
         self.explanation=ExplanationOverlay(host,'估算与对比条件',[
-            self.note.text(),
-            self.conditions.text(),self.caveat.text(),
-            self.quality.text()])
+            ('估算总量','已记录的额度下降达到 5 个百分点，且对应 Token 记录完整、额度新鲜、读数连续。'),
+            ('同条件对比',f'周剩余降到 {STRICT_BADGE_REMAINING}% 后才判断是否提醒涨跌。优先选最近的可比周期，两轮需有足够读数，且套餐、重置类型和用法相近。缺失档位保留为未知。'),
+            ('参考差异',f'两轮各按当轮用法估算。当前周期至少观察 {REFERENCE_BADGE_DROP} 个百分点，且最近三次估算趋稳后显示差异。'),
+            ('本轮记录',self.quality)])
     def set_snapshot(self,snapshot):
         self.history=snapshot.get('quota_history') or {};self.cycles=self.history.get('cycles') or []
         if self.selected_id not in {c['id'] for c in self.cycles}:self.selected_id=self.cycles[0]['id'] if self.cycles else None
@@ -280,38 +291,44 @@ class QuotaCompareView(QWidget):
         rank=index+(1 if self.cycles and self.cycles[0]['closed'] else 0)
         return '上一轮额度' if rank<=1 else f'前{rank}轮额度'
     def select_current(self,*args):
-        self.selected_id=self.choice.currentData();self.update_selected()
+        self.selected_id=self.choice.currentData();self.update_selected(animate=True)
     def select_id(self,key):self.choice.setCurrentIndex(self.choice.findData(key))
-    def update_selected(self):
+    def update_selected(self,animate=False):
         c=next((c for c in self.cycles if c['id']==self.selected_id),None)
         self.choice.setEnabled(bool(self.cycles));self.plot.set_data(self.cycles,self.selected_id)
         index=self.choice.currentIndex();self.previous.setEnabled(index>=0 and index<len(self.cycles)-1);self.next.setEnabled(index>0)
         older=self.cycles[index+1] if 0<=index<len(self.cycles)-1 else None
+        baseline=next((row for row in self.cycles if c and row['id']==c.get('baseline_cycle_id')),None)
+        older=baseline or older
         current_total=c.get('estimated_total') if c else None
         previous_total=older.get('estimated_total') if older else None
         self.capacity_pair.setVisible(bool(older and (current_total or previous_total)))
         self.current_capacity.setText(compact_tokens(current_total) if current_total else '—')
         self.previous_capacity.setText(compact_tokens(previous_total) if previous_total else '—')
-        reference=capacity_reference(c,older,self.history.get('pending',False))
+        self.baseline_title.setText('对照 '+datetime.fromtimestamp(older['start']).strftime('%m/%d') if older and older.get('start') else '对照周期')
+        reference_for=capacity_reference if c and c['closed'] else current_reference
+        reference=reference_for(c,older,self.history.get('pending',False))
         change=reference['change']
-        self.reference.setVisible(change is not None and (not c or c.get('change') is None or bool(c.get('comparison_block'))))
+        observing=reference.get('observing')
+        self.reference.setVisible(bool(observing or change is not None) and (not c or c.get('change') is None or bool(c.get('comparison_block'))))
         self.reference.setText(('初步参考差异 ' if reference['preliminary'] else '参考差异 ')+
-                               (f'{change:+.1f}%' if change else '0.0%')+' · 按各自用法')
-        self.reference.setAccessibleDescription(reference['reason'])
+                               (f'{change:+.1f}%' if change else '0.0%')+
+                               (' · 未达卡片提示门槛' if change is not None and abs(change)<REFERENCE_BADGE_MIN else ' · 按各自用法'))
+        if observing:self.reference.setText('参考差异观察中')
+        baseline_note=('对照'+cycle_label(older)+'。') if older else ''
+        self.reference.setToolTip(baseline_note+(observing or reference['reason']))
+        self.reference.setAccessibleDescription(baseline_note+(observing or reference['reason']))
         presentation=cycle_messages(c,self.history,older)
         self.estimate_hint.setText(presentation['estimate']);self.estimate_hint.setVisible(not c or not c.get('estimated_total'));self.comparison.setText(presentation['title']);self.comparison_reason.setText(presentation['reason'])
         self.coverage.setVisible(presentation['show_coverage']);self.coverage_text.setVisible(presentation['show_coverage'])
         self.coverage.setValue(round(min(20,presentation['coverage'])*10));self.coverage_text.setText(f"已观察 {presentation['coverage']:g} / 20 个百分点")
         if not c:
-            self.choice.title='暂无额度周期';self.choice.update();self.period_line.setText('重置后开始记录新一轮')
-            self.used.setText('—');self.estimate.setText('—');self.detail.setText('');self.quality.setText('缺少额度记录，无法只靠 Token 还原总量。');return
-        self.choice.title=self.cycle_title(c);self.choice.update()
-        begin=datetime.fromtimestamp(c['start']).strftime('%m/%d %H:%M')
-        end=datetime.fromtimestamp(c['end']).strftime('%m/%d %H:%M') if c['closed'] else '至今'
+            self.choice.title='暂无额度周期';self.choice.animate_caption(self.choice.title,False);self.period_line.setText('重置后开始记录新一轮')
+            self.metrics.set_values('—','—');self.quality='缺少额度记录，无法只靠 Token 还原总量。';return
+        self.choice.title=quota_text(c);self.choice.animate_caption(self.choice.title,animate)
         kind={'natural':'自然重置','extra':'额外补充','inferred':'起点推定','changed':'套餐或窗口变化'}.get(c['kind'],'起点推定')
-        self.period_line.setText(begin+' — '+end+'  '+kind)
-        self.used.setText(compact_tokens(c['used']));self.estimate.setText(compact_tokens(c['estimated_total']) if c['estimated_total'] else '—')
-        self.detail.setText(f"剩余 {c['remaining']:g}%"+('  '+str(c['plan']).upper() if c.get('plan') else ''))
+        self.period_line.setText(kind);self.period_line.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.metrics.set_values(compact_tokens(c['used']),compact_tokens(c['estimated_total']) if c['estimated_total'] else '—')
         parts=[]
         if self.history.get('pending'):parts.append('正在补齐历史记录')
         elif not c['complete']:parts.append('部分记录受限')
@@ -322,5 +339,4 @@ class QuotaCompareView(QWidget):
         else:parts.append(f"已记录额度下降 {c['drop']:g} 个百分点")
         if c.get('per_percent'):parts.append('每 1% ≈ '+compact_tokens(round(c['per_percent']))+' Token')
         if c.get('model'):parts.append('主模型 '+c['model']+f"（{c.get('model_share',0):.0%}）")
-        self.quality.setText('\n'.join(parts))
-        if self.rules.expanded:self.rules.refresh_content()
+        self.quality='\n'.join(parts)

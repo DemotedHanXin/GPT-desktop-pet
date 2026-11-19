@@ -11,7 +11,7 @@ from PySide6.QtCore import QRectF,QPoint,QPointF,QSizeF,Qt
 from PySide6.QtGui import QPixmap,QPainter,QPainterPath,QColor,QPen,QRegion,QFontMetrics
 from PySide6.QtWidgets import QWidget,QToolButton,QAbstractScrollArea
 from spring_motion import container_progress,stage
-from ui_theme import SURFACE,ISLAND
+from ui_theme import SURFACE,ISLAND,STATUS_MODULE_RADIUS,STATUS_FOOTER_RADIUS,status_footer_path
 
 PANEL_RADIUS=18.
 
@@ -33,6 +33,11 @@ def raster_offset(point,canvas,ratio,origin=QPointF()):
     def native(v):return math.floor(v+.5) if v>=0 else math.ceil(v-.5)
     return QPointF((native((point.x()-origin.x())*ratio)-native((canvas.x()-origin.x())*ratio))/ratio,
                    (native((point.y()-origin.y())*ratio)-native((canvas.y()-origin.y())*ratio))/ratio)
+
+
+def align_raster(p,point):
+    ratio=p.device().devicePixelRatioF()
+    return QPointF(pixel_size(point.x(),ratio)/ratio,pixel_size(point.y(),ratio)/ratio)
 
 
 def complete_frame(bubble):
@@ -232,6 +237,7 @@ def mix_color(a,z,f):
 
 def shared_parent(key):
     """Semantic ownership, independent of coincident/overlapping rectangles."""
+    if '/' in key:return key.rsplit('/',1)[0]
     for prefix,parent in (('conversation_','conversations'),('quota_','quota'),
                           ('today_tokens_','today_tokens'),('live_rate_','live_rate'),
                           ('statistics_plot_','statistics_plot'),('statistics_reset_','statistics_reset'),
@@ -270,9 +276,13 @@ class SharedPart:
         self.fit=('left' if key in ('navigation','task_caption','details','quota','conversations','today_tokens','live_rate','statistics_plot_left','statistics_reset') or key.startswith(('conversation_title_','conversation_detail_')) else
                   'right' if key.startswith('quota_value_') or key in ('today_tokens_link','today_tokens_amount','live_rate_value','statistics_plot_right') else
                   'center' if key.startswith(('statistics_tab_','statistics_range_')) or key in ('statistics_plot_title','statistics_plot_middle','statistics_plot_empty','conversation_counter') else 'stretch')
-        self.backgrounds=[];self.corner=10 if key=='quota' else 6 if key in ('today_tokens','live_rate') else 0
-        self.corners=tuple(11 if key=='quota' and state.expanded else self.corner for state in (start,end))
+        self.footer_side={'live_rate':-1,'today_tokens':1}.get(key,0)
+        self.backgrounds=[];self.corner=STATUS_MODULE_RADIUS if key=='quota' else STATUS_FOOTER_RADIUS if self.footer_side else 0
+        self.footer_alignment=(not start.expanded,not end.expanded)
         self.single=key.startswith('quota_track_') or key=='statistics_plot';self.background_painter=None
+        role=key.rsplit('/',1)[-1]
+        self.fixed=role.startswith('fixed-')
+        if self.fixed:self.fit=role.split('-')[1]
         for state in (start,end):
             local=state.shared_bounds[key];ratio=state.content.devicePixelRatioF()
             left,top=pixel_size(local.x(),ratio),pixel_size(local.y(),ratio)
@@ -282,7 +292,7 @@ class SharedPart:
             image=state.content.copy(crop);image.setDevicePixelRatio(ratio)
             clip=state.visible_bounds.get(key,QRectF(QPointF(),state.rect.size()))
             self.clips.append(clip.translated(state.rect.topLeft()))
-            if self.fit!='stretch' and not key.startswith('conversation_'):
+            if self.fit!='stretch' and not self.fixed and not key.startswith('conversation_'):
                 self.backgrounds.append(image.toImage().pixelColor(min(image.width()-1,max(0,round(3*ratio))) if self.corner else 0,image.height()//2 if self.corner else 0))
             clear_outside(image,clip.translated(-left/ratio,-top/ratio))
             children=[]
@@ -295,6 +305,18 @@ class SharedPart:
                 q.end()
             self.frames.append(image);self.pixel_rects.append(crop)
             self.rects.append(QRectF(state.rect.topLeft()+QPointF(left/ratio,top/ratio),image.deviceIndependentSize()))
+        if role.startswith('report-panel'):
+            self.background_painter=self._paint_report_selection if role=='report-panel-selection' else self._paint_report_panel
+            radius=role.removeprefix('report-panel')
+            self.corner=int(radius) if radius.isdecimal() else {
+                'report-panel-stat':6,'report-panel-segments':8,'report-panel-segment-pill':5}.get(role,7)
+            self.report_fill={'report-panel-segments':'#eae1f2',
+                              'report-panel-segment-pill':SURFACE}.get(role,'#f5f0f8')
+            self.frames=[];return
+        if self.fixed:
+            self.same=True
+            self.fixed_frames=sorted(self.frames,key=lambda image:image.deviceIndependentSize().width())
+            return
         self.same=self.frames[0].toImage()==self.frames[1].toImage()
         if key=='statistics':
             from dashboard_cards import paint_deck_surface
@@ -311,7 +333,7 @@ class SharedPart:
                 q=QPainter(out);self._draw(q,image,QRectF(0,0,width,height));q.end();normalized.append(out)
             self.same=normalized[0].toImage()==normalized[1].toImage()
     def prepare(self,ratio):
-        if self.same or self.background_painter or self.detail_direction is not None:return
+        if self.background_painter or self.same or self.detail_direction is not None:return
         size=(max(pixel_size(r.width(),ratio) for r in self.rects),max(pixel_size(r.height(),ratio) for r in self.rects))
         if self.buffers is not None and self.buffers[0]==(ratio,size):return
         images=[]
@@ -319,12 +341,27 @@ class SharedPart:
             image=QPixmap(*size);image.setDevicePixelRatio(ratio);image.fill(Qt.GlobalColor.transparent);images.append(image)
         self.buffers=((ratio,size),images);self.buffer_builds+=1
     def geometry(self,f):return mix_rect(self.rects[0],self.rects[1],f)
-    def corner_at(self,f):return self.corners[0]+(self.corners[1]-self.corners[0])*f
+    def _paint_report_panel(self,p,rect):
+        p.setPen(Qt.PenStyle.NoPen);p.setBrush(QColor(theme_color(self.report_fill)))
+        p.drawRoundedRect(rect,self.corner,self.corner)
+    def _paint_report_selection(self,p,rect):
+        from ui_theme import PRIMARY
+        fill=QColor(theme_color(PRIMARY));outline=QColor(fill)
+        fill.setAlpha(22);outline.setAlpha(90)
+        p.setPen(QPen(outline,1));p.setBrush(fill)
+        p.drawRoundedRect(rect.adjusted(2.5,1.5,-2.5,-1.5),7,7)
+    def outline_at(self,rect,f):
+        if self.footer_side:
+            start_align,end_align=self.footer_alignment
+            return status_footer_path(rect,self.footer_side,start_align*(1.-f)+end_align*f)
+        path=QPainterPath()
+        path.addRoundedRect(rect,self.corner,self.corner)
+        return path
     def _draw(self,p,image,rect):
         if self.fit=='stretch':p.drawPixmap(rect,image,QRectF(image.rect()));return
         width=image.deviceIndependentSize().width()
         x=rect.x() if self.fit=='left' else rect.right()-width if self.fit=='right' else rect.center().x()-width/2
-        p.drawPixmap(QPointF(x,rect.y()),image)
+        p.drawPixmap(align_raster(p,QPointF(x,rect.y())),image)
     def paint(self,p,f,canvas):
         target=self.geometry(f).translated(-canvas.x(),-canvas.y())
         p.save();p.setOpacity(1.);p.setClipRect(target,Qt.ClipOperation.IntersectClip)
@@ -343,12 +380,20 @@ class SharedPart:
             p.restore();return
         if self.background_painter:
             self.background_painter(p,target);p.restore();return
+        if self.fixed:
+            # Draw one unscaled copy. If a paragraph wraps differently, use
+            # the narrow layout until the wider copy fits the moving bounds.
+            narrow,wide=self.fixed_frames
+            image=wide
+            if narrow.height()!=wide.height() and target.width()+.5<wide.deviceIndependentSize().width():image=narrow
+            self._draw(p,image,target);p.restore();return
         source=QRectF(self.frames[0].rect())
         if self.backgrounds:
             color=mix_color(*self.backgrounds,f)
             p.setPen(Qt.PenStyle.NoPen);p.setBrush(theme_color(color))
             if self.corner:
-                radius=self.corner_at(f);path=QPainterPath();path.addRoundedRect(target,radius,radius);p.setClipPath(path,Qt.ClipOperation.IntersectClip);p.drawPath(path)
+                path=self.outline_at(target,f)
+                p.setClipPath(path,Qt.ClipOperation.IntersectClip);p.drawPath(path)
             else:p.fillRect(target,color)
         if (self.single and f<=.7) or self.same or f<=0:
             self._draw(p,self.frames[0],target);p.restore();return
@@ -361,7 +406,7 @@ class SharedPart:
         mixed.fill(Qt.GlobalColor.transparent);q=QPainter(mixed);q.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         q.setOpacity((256-weight)/256);self._draw(q,self.frames[0],local)
         q.setOpacity(1.);q.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus);q.drawPixmap(0,0,weighted);q.end()
-        p.drawPixmap(target.topLeft(),mixed);p.restore()
+        p.drawPixmap(align_raster(p,target.topLeft()),mixed);p.restore()
 
 
 class ExclusivePart:
@@ -401,7 +446,7 @@ class ExclusivePart:
         p.save();p.setOpacity(opacity);p.setClipRect(target,Qt.ClipOperation.IntersectClip)
         clip=self.clip.translated(rect.center().x()-self.state_rect.width()/2,rect.y())
         p.setClipRect(clip.translated(-canvas.x(),-canvas.y()),Qt.ClipOperation.IntersectClip)
-        p.drawPixmap(target.topLeft(),self.image);p.restore()
+        p.drawPixmap(align_raster(p,target.topLeft()),self.image);p.restore()
 
 
 class SurfaceMorph:
@@ -417,8 +462,9 @@ class SurfaceMorph:
         for part in self.exclusive_parts:part.state_rect.translate(delta)
         if self._landing:
             key,*rest=self._landing;self._landing=((key[0]+delta.x(),key[1]+delta.y(),*key[2:]),*rest)
-    def __init__(self,start,end):
+    def __init__(self,start,end,translation_only=False):
         self.start=start;self.end=end;self._landing=None
+        self.translation_only=translation_only
         self.shrinking=end.rect.width()*end.rect.height()<start.rect.width()*start.rect.height()
         self.page_switch=bool(start.expanded and end.expanded and start.page!=end.page and not start.island and not end.island)
         self.shared_parts={};self.exclusive_parts=[];self.body_frames=(start.content,end.content)
@@ -475,6 +521,7 @@ class SurfaceMorph:
             for satellite,image in state.satellites:rect=rect.united(satellite)
         return rect.adjusted(-1,-1,1,1).toAlignedRect()
     def prepare_landing(self,canvas,ratio):
+        if self.translation_only:return
         for part in self.shared_parts.values():part.prepare(ratio)
         if self.end.frame is None:return
         key=(canvas.x(),canvas.y(),canvas.width(),canvas.height(),ratio)
@@ -489,6 +536,11 @@ class SurfaceMorph:
             q.end();frames.append(image)
         self._landing=(key,frames,frames[0].copy(),frames[0].copy())
     def paint(self,p,time,canvas):
+        if self.translation_only:
+            state=self.end if time>=1 else self.start
+            position=state.frame_origin if time<=0 or time>=1 else self.geometry(time).topLeft()
+            p.drawPixmap(raster_offset(position,canvas.topLeft(),p.device().devicePixelRatioF(),state.screen_origin),state.frame)
+            return
         if time<=0 and self.start.frame is not None:
             a=self.start;p.drawPixmap(raster_offset(a.frame_origin,canvas.topLeft(),p.device().devicePixelRatioF(),a.screen_origin),a.frame);return
         if time>=.9 and self.end.frame is not None:
